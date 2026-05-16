@@ -1,0 +1,8 @@
+{
+  "sessionRoot": "./wecaht/default",
+  "httpProxy": "",
+  "disableLocalProxy": true,
+  "codexCommand": "codex",
+  "codexWorkdir": ".",
+  "codexTimeoutMs": 0
+}

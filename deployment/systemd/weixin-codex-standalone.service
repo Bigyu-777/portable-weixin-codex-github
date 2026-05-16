@@ -1,0 +1,17 @@
+[Unit]
+Description=Weixin Codex Standalone Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/portable-weixin-codex
+Environment=HOME=%h
+Environment=NODE_ENV=production
+ExecStart=%h/portable-weixin-codex/standalone-run.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
