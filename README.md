@@ -9,6 +9,8 @@ Standalone WeChat-to-Codex bridge for running Codex conversations from WeChat. T
 - Standalone WeChat bridge with QR login
 - One session directory per contact
 - One Codex thread per contact
+- Per-contact model switching with `/model`
+- Per-contact reasoning-effort switching with `/effort`
 - `/send` support for sending referenced files back to the user
 - Optional multi-instance deployment: one WeChat account per service instance
 - systemd user service templates for auto-start
@@ -84,6 +86,20 @@ systemctl --user enable --now weixin-codex@team1.service
 - `codexCommand`: path to the Codex CLI
 - `codexWorkdir`: working directory passed to Codex
 - `codexTimeoutMs`: `0` means no timeout
+
+## WeChat Commands
+
+- `/help`: show command help
+- `/where`: show current session root and thread info
+- `/ls`: list files in the current contact session directory
+- `/model`: show current model and available models
+- `/model <index|name>`: switch model for the current contact
+- `/effort`: show current reasoning effort and available levels
+- `/effort <index|name>`: switch reasoning effort for the current contact
+- `/send`: send the quoted file back if resolvable
+- `/send <filename>`: fuzzy-match and send a file from the current session directory
+- `/new`: start a fresh contact session directory and Codex thread
+- `/reset`: clear the current contact binding
 
 ## Security
 
