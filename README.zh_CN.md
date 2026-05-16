@@ -4,6 +4,8 @@
 
 这是一个可独立部署的微信到 Codex 桥接项目，目标是把 Codex 会话直接接到微信里，并支持单账号或多账号常驻运行。
 
+这个仓库是一个 **预编译可运行快照**。如果你想直接 clone 后运行，请优先看 [INSTALL.md](./INSTALL.md)。
+
 ## 功能
 
 - 微信扫码登录
@@ -39,6 +41,8 @@ npm install
 ./standalone-login.sh
 ./standalone-run.sh
 ```
+
+如果你关心“为什么 clone 下来能不能直接跑”，请先看 [INSTALL.md](./INSTALL.md)。
 
 ### 多账号模式
 

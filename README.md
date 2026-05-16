@@ -4,6 +4,8 @@
 
 Standalone WeChat-to-Codex bridge for running Codex conversations from WeChat. This repo is packaged for self-hosted deployment and multi-account operation.
 
+This repository is a **prebuilt runnable snapshot**. If you want clone-and-run instructions, start with [INSTALL.md](./INSTALL.md).
+
 ## Features
 
 - Standalone WeChat bridge with QR login
@@ -39,6 +41,8 @@ npm install
 ./standalone-login.sh
 ./standalone-run.sh
 ```
+
+See [INSTALL.md](./INSTALL.md) for the direct-run packaging notes.
 
 ### Multi-account
 
