@@ -71,6 +71,7 @@ function trimReply(text) {
 }
 const RESUME_ATTEMPT_TIMEOUT_MS = 30_000;
 const LONG_RUNNING_PROGRESS_INTERVAL_MS = 180_000;
+const PROGRESS_THROTTLE_MS = 4_000;
 function trimProgressText(text) {
     const normalized = text.trim().replace(/\s+/g, " ");
     if (!normalized) {
@@ -79,6 +80,53 @@ function trimProgressText(text) {
     return normalized.length > 180
         ? `${normalized.slice(0, 180)}...`
         : normalized;
+}
+function trimCommandText(text) {
+    const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+    if (!normalized) {
+        return "";
+    }
+    return normalized.length > 220
+        ? `${normalized.slice(0, 220)}...`
+        : normalized;
+}
+function trimCommandOutput(text) {
+    const normalized = String(text ?? "").trim();
+    if (!normalized) {
+        return "";
+    }
+    const lines = normalized.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const compact = lines.slice(0, 4).join("\n");
+    return compact.length > 500
+        ? `${compact.slice(0, 500)}...`
+        : compact;
+}
+function progressCommandLabel(command) {
+    const text = trimCommandText(command);
+    if (!text) {
+        return "我在终端跑一个命令。";
+    }
+    return `我在终端跑：\n${text}`;
+}
+function progressCommandCompleted(item) {
+    const exitCode = item?.exit_code;
+    const output = trimCommandOutput(item?.aggregated_output);
+    if (exitCode === 0) {
+        return output
+            ? `跑完了，输出前几行：\n${output}`
+            : "这条命令跑完了。";
+    }
+    return [
+        `这条命令失败了，退出码 ${String(exitCode ?? "unknown")}。`,
+        output ? `输出前几行：\n${output}` : "",
+    ].filter(Boolean).join("\n");
+}
+function normalizeProgressMessage(message) {
+    return String(message ?? "")
+        .trim()
+        .replace(/\s+/g, " ")
+        .replace(/已运行约 \d+ 分钟/g, "已运行约 N 分钟")
+        .toLowerCase();
 }
 function emitProgress(params, message) {
     if (!message || typeof params.onProgress !== "function") {
@@ -146,14 +194,28 @@ async function runCodexOnce(params) {
         let finished = false;
         let timedOut = false;
         let stdoutBuffer = "";
-        let sentStarted = false;
-        let sentPlan = false;
-        let sawCommand = false;
+        let lastProgressSentAt = 0;
+        const sentProgressMessages = new Set();
+        let lastCommandText = "";
         const startedAt = Date.now();
+        const emitDetailedProgress = (message, options = {}) => {
+            const text = String(message ?? "").trim();
+            const normalized = normalizeProgressMessage(text);
+            if (!text || sentProgressMessages.has(normalized)) {
+                return;
+            }
+            const now = Date.now();
+            if (!options.force && now - lastProgressSentAt < PROGRESS_THROTTLE_MS) {
+                return;
+            }
+            sentProgressMessages.add(normalized);
+            lastProgressSentAt = now;
+            emitProgress(params, text);
+        };
         const longRunningTimer = setInterval(() => {
             const elapsedMs = Date.now() - startedAt;
             const elapsedMin = Math.max(1, Math.round(elapsedMs / 60_000));
-            emitProgress(params, `进度：任务仍在执行，已运行约 ${elapsedMin} 分钟。`);
+            emitDetailedProgress(`还在处理，已经约 ${elapsedMin} 分钟；我会继续等结果。`, { force: true });
         }, LONG_RUNNING_PROGRESS_INTERVAL_MS);
         const processJsonLine = (line) => {
             let parsed;
@@ -163,28 +225,24 @@ async function runCodexOnce(params) {
             catch {
                 return;
             }
-            if (!sentStarted && parsed.type === "thread.started") {
-                sentStarted = true;
+            if (parsed.type === "session.resumed") {
+                emitDetailedProgress("我接着上次的线程继续处理。", { force: true });
                 return;
             }
             if (parsed.type === "item.started" && parsed.item?.type === "command_execution") {
-                sawCommand = true;
-                if (!sentPlan) {
-                    emitProgress(params, "进度：Codex 已开始执行任务。");
-                    sentPlan = true;
-                }
+                lastCommandText = trimCommandText(parsed.item.command);
+                emitDetailedProgress(progressCommandLabel(parsed.item.command), { force: true });
                 return;
             }
-            if (!sentPlan
-                && !sawCommand
-                && parsed.type === "item.completed"
-                && parsed.item?.type === "agent_message"
-                && typeof parsed.item.text === "string") {
-                const message = trimProgressText(parsed.item.text);
-                if (message) {
-                    emitProgress(params, `进度：${message}`);
-                    sentPlan = true;
+            if (parsed.type === "item.completed" && parsed.item?.type === "command_execution") {
+                const commandText = trimCommandText(parsed.item.command);
+                const output = trimCommandOutput(parsed.item.aggregated_output);
+                const exitCode = parsed.item.exit_code;
+                const shouldReportCompletion = exitCode !== 0 || Boolean(output) || commandText !== lastCommandText;
+                if (shouldReportCompletion) {
+                    emitDetailedProgress(progressCommandCompleted(parsed.item), { force: true });
                 }
+                return;
             }
         };
         const timer = timeoutMs != null

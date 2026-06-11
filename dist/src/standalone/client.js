@@ -8,7 +8,7 @@ import { sendWeixinMediaFile } from "../messaging/send-media.js";
 import { sendMessageWeixin } from "../messaging/send.js";
 import { getSyncBufFilePath, loadGetUpdatesBuf, saveGetUpdatesBuf } from "../storage/sync-buf.js";
 import { logger } from "../util/logger.js";
-import { handleStandaloneCommand } from "./commands.js";
+import { buildDefaultImageSkillPrompt, buildStandaloneModePrompt, handleStandaloneCommand } from "./commands.js";
 import { runCodexForPeer } from "./codex-runner.js";
 import { describeStandaloneMediaKind, resolveLatestPreferredStandaloneMedia, resolveStandaloneQuotedMedia, saveStandaloneMediaRecords, saveStandaloneOutboundMediaRecord, } from "./media-index.js";
 import { saveIncomingMediaToSession } from "./media-store.js";
@@ -235,6 +235,37 @@ function getFileRecordKind(filePath) {
     }
     return "file";
 }
+function looksLikeImageGenerationOrEdit(text, hasImageContext) {
+    const value = String(text ?? "").trim();
+    if (!value) {
+        return false;
+    }
+    if (/image2|gpt\s*image|生图|出图|文生图|图生图/i.test(value)) {
+        return true;
+    }
+    if (/(生成|画|绘制|创建|做|设计).{0,16}(图|图片|海报|头像|插画|logo|壁纸|封面|表情包|配图|照片)/i.test(value)) {
+        return true;
+    }
+    if (/(图|图片|海报|头像|插画|logo|壁纸|封面|表情包|配图|照片).{0,16}(生成|画|绘制|创建|做|设计)/i.test(value)) {
+        return true;
+    }
+    if (!hasImageContext) {
+        return false;
+    }
+    return /(改|修|编辑|处理|美化|换|替换|去掉|删除|添加|加上|抠图|扩图|合成|风格|风格化|变成|转成|换背景|参考|照着|重绘|高清|放大|去水印|保留主体)/i.test(value);
+}
+function maybeApplyDefaultImageSkill(prompt, session, hasImageContext) {
+    if (session?.activeSkill || session?.activePlugin) {
+        return prompt;
+    }
+    if (/请使用 Codex skill：|请优先使用 Codex plugin：/.test(prompt)) {
+        return prompt;
+    }
+    if (!looksLikeImageGenerationOrEdit(prompt, hasImageContext)) {
+        return prompt;
+    }
+    return buildDefaultImageSkillPrompt(prompt) ?? prompt;
+}
 async function buildCodexPrompt(text) {
     const url = extractFirstUrl(text);
     if (!url) {
@@ -273,14 +304,17 @@ function createProgressReporter(to, contextToken, initialSessionContextToken) {
     const sentMessages = new Set();
     return async (message) => {
         const text = String(message ?? "").trim();
-        if (!text || sentMessages.has(text)) {
+        const dedupeKey = text.replace(/\s+/g, " ").replace(/已经约 \d+ 分钟/g, "已经约 N 分钟").toLowerCase();
+        if (!text || sentMessages.has(dedupeKey)) {
             return;
         }
         const now = Date.now();
-        if (now - lastSentAt < 3000) {
+        const important = /我在终端跑|跑完了|失败了|恢复上次|接着上次|还在处理/.test(text);
+        const minIntervalMs = important ? 700 : 5000;
+        if (now - lastSentAt < minIntervalMs) {
             return;
         }
-        sentMessages.add(text);
+        sentMessages.add(dedupeKey);
         lastSentAt = now;
         await replyText(to, text, contextToken || initialSessionContextToken);
     };
@@ -352,11 +386,85 @@ async function handleIncomingMessage(message) {
             console.log(`[reply] command send media -> ${peerId} files=${commandResult.sendMediaPaths.length} paths=${JSON.stringify(commandResult.sendMediaPaths)}`);
             sentMedia = await sendLocalFiles(peerId, commandResult.sendMediaPaths, contextToken || session.contextToken, commandResult.sendMediaText || "");
         }
+        if (commandResult.codexPrompt) {
+            const commandPromptParts = [commandResult.codexPrompt];
+            let commandImagePaths = [...media.imagePaths];
+            let commandHasImageContext = media.imagePaths.length > 0;
+            if (quotedMedia) {
+                if (quotedMedia.kind === "image") {
+                    commandImagePaths = [...commandImagePaths, quotedMedia.path];
+                    commandHasImageContext = true;
+                    commandPromptParts.unshift([
+                        "用户这次引用了一张之前保存的图片。",
+                        `引用图片路径: ${quotedMedia.path}`,
+                    ].join("\n"));
+                }
+                else {
+                    commandPromptParts.unshift([
+                        `用户这次引用了一个之前保存的${describeStandaloneMediaKind(quotedMedia.kind)}。`,
+                        `引用文件路径: ${quotedMedia.path}`,
+                    ].join("\n"));
+                }
+            }
+            else if (quotedMediaItem) {
+                commandPromptParts.unshift([
+                    "用户引用了一个附件，但本地没有匹配到保存记录。",
+                    "如果任务需要具体文件内容，请提醒用户重新发送或重新引用。",
+                ].join("\n"));
+            }
+            if (directMediaPaths.length > 0) {
+                commandPromptParts.unshift([
+                    "用户这次随消息发送了附件，已保存到当前会话目录。",
+                    ...directMediaPaths.map((filePath) => `- ${filePath}`),
+                ].join("\n"));
+            }
+            commandPromptParts.push("如果你生成了新的图片或文件，请把最终生成文件保存到当前会话目录，并在回复里写出完整绝对路径。");
+            const sessionFilesBeforeCodex = snapshotSessionFiles(workdir);
+            const reportProgress = createProgressReporter(peerId, contextToken, session.contextToken);
+            const latestSession = getPeerSession(peerId);
+            const commandPrompt = maybeApplyDefaultImageSkill(commandPromptParts.filter(Boolean).join("\n\n"), latestSession, commandHasImageContext);
+            const codexInput = await buildCodexPrompt(buildStandaloneModePrompt(commandPrompt, latestSession));
+            const codexResult = await runCodexForPeer({
+                prompt: codexInput.prompt,
+                threadId: session.threadId,
+                model: session.model,
+                reasoningEffort: session.reasoningEffort,
+                workdir,
+                enableSearch: codexInput.enableSearch,
+                imagePaths: commandImagePaths,
+                onProgress: reportProgress,
+            });
+            if (!codexResult.ok) {
+                console.error(`[codex-error] peer=${peerId} thread=${session.threadId ?? "none"} command=${JSON.stringify(text)} text=${JSON.stringify(codexResult.text)} stderr=${JSON.stringify(codexResult.stderr)}`);
+            }
+            const reply = codexResult.ok
+                ? codexResult.text
+                : `${codexResult.text}${codexResult.stderr ? `\n\nstderr:\n${codexResult.stderr}` : ""}`;
+            const generatedFiles = codexResult.ok
+                ? Array.from(new Set([
+                    ...extractExistingFilesFromText(reply, workdir),
+                    ...detectChangedSessionFiles(workdir, sessionFilesBeforeCodex),
+                ]))
+                : [];
+            console.log(`[reply] command codex -> ${peerId} thread=${codexResult.threadId ?? "new/unknown"} files=${generatedFiles.length}`);
+            sentMedia = generatedFiles.length > 0
+                ? await sendGeneratedFiles(peerId, reply, generatedFiles, contextToken || session.contextToken)
+                : false;
+            if (!sentMedia) {
+                await replyText(peerId, reply, contextToken || session.contextToken);
+            }
+            updatePeerSession(peerId, (previous) => ({
+                ...previous,
+                threadId: codexResult.threadId || previous.threadId,
+                contextToken: contextToken || previous.contextToken,
+                lastOutboundAt: Date.now(),
+            }));
+        }
         if (commandResult.reply) {
             console.log(`[reply] command -> ${peerId}`);
             await replyText(peerId, commandResult.reply, contextToken || session.contextToken);
         }
-        if (sentMedia || commandResult.reply) {
+        if (sentMedia || commandResult.reply || commandResult.codexPrompt) {
             updatePeerSession(peerId, (previous) => ({
                 ...previous,
                 lastOutboundAt: Date.now(),
@@ -401,7 +509,9 @@ async function handleIncomingMessage(message) {
     }
     const sessionFilesBeforeCodex = snapshotSessionFiles(workdir);
     const reportProgress = createProgressReporter(peerId, contextToken, session.contextToken);
-    const codexInput = await buildCodexPrompt(rawPrompt);
+    const latestSession = getPeerSession(peerId);
+    const imagePrompt = maybeApplyDefaultImageSkill(rawPrompt, latestSession, imagePaths.length > 0);
+    const codexInput = await buildCodexPrompt(buildStandaloneModePrompt(imagePrompt, latestSession));
     const codexResult = await runCodexForPeer({
         prompt: codexInput.prompt,
         threadId: session.threadId,
